@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { ArrowUp, Mic, MicOff, Square } from 'lucide-react';
+import { ArrowUp, AudioLines, Mic, MicOff, Square } from 'lucide-react';
 
 interface ComposerProps {
   value: string;
@@ -7,6 +7,7 @@ interface ComposerProps {
   onSubmit: () => void;
   onStop: () => void;
   onToggleVoice: () => void;
+  onOpenVoiceMode: () => void;
   isStreaming: boolean;
   isListening: boolean;
   voiceSupported: boolean;
@@ -19,6 +20,7 @@ export function Composer({
   onSubmit,
   onStop,
   onToggleVoice,
+  onOpenVoiceMode,
   isStreaming,
   isListening,
   voiceSupported,
@@ -86,12 +88,12 @@ export function Composer({
               onClick={onToggleVoice}
               title={
                 !voiceSupported
-                  ? 'Voice input unavailable in this browser'
+                  ? 'Voice dictation unavailable in this browser'
                   : isListening
                     ? 'Stop voice input'
-                    : 'Voice input'
+                    : 'Voice dictation'
               }
-              aria-label={isListening ? 'Stop voice input' : 'Start voice input'}
+              aria-label={isListening ? 'Stop voice input' : 'Start voice dictation'}
               className={[
                 'w-10 h-10 rounded-xl flex items-center justify-center transition-colors cursor-pointer',
                 isListening
@@ -100,6 +102,16 @@ export function Composer({
               ].join(' ')}
             >
               {isListening ? <MicOff className="w-[18px] h-[18px]" /> : <Mic className="w-[18px] h-[18px]" />}
+            </button>
+
+            <button
+              type="button"
+              onClick={onOpenVoiceMode}
+              title="Open Voice Mode"
+              aria-label="Open Voice Mode"
+              className="w-10 h-10 rounded-xl flex items-center justify-center text-blue-600 dark:text-sky-400 bg-blue-50/80 dark:bg-sky-500/10 hover:bg-blue-100 dark:hover:bg-sky-500/20 transition-colors cursor-pointer"
+            >
+              <AudioLines className="w-[18px] h-[18px]" />
             </button>
 
             <button

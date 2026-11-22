@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, Moon, PanelLeftOpen, SquarePen, Sun } from 'lucide-react';
+import { AudioLines, ChevronDown, Moon, PanelLeftOpen, SquarePen, Sun } from 'lucide-react';
 import { ChatMessageItem } from './components/ChatMessageItem';
 import { ChromoLogo } from './components/ChromoLogo';
 import { Composer } from './components/Composer';
 import { Sidebar } from './components/Sidebar';
+import { VoiceMode } from './components/VoiceMode';
+import { cleanTextForSpeech, selectBestFemaleVoice } from './utils/voiceSpeech';
 import { MODEL_OPTIONS } from './types/chat';
 import type { ChatMessage, Conversation, ModelOption } from './types/chat';
 
@@ -74,16 +76,6 @@ function createId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function stripMarkdownForSpeech(text: string): string {
-  return text
-    .replace(/```[\s\S]*?```/g, ' Code snippet omitted. ')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .replace(/[#>*_~-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 function getSpeechRecognitionCtor(): SpeechRecognitionConstructor | null {
   if (typeof window === 'undefined') return null;
   const w = window as unknown as {
@@ -137,12 +129,15 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
+  const [voiceModeOpen, setVoiceModeOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const conversationsRef = useRef<Conversation[]>(conversations);
+  conversationsRef.current = conversations;
 
   const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window;
   const voiceSupported = useMemo(() => Boolean(getSpeechRecognitionCtor()), []);
@@ -162,6 +157,9 @@ export default function App() {
     if (!activeId) return conversations[0] || null;
     return conversations.find((c) => c.id === activeId) || conversations[0] || null;
   }, [conversations, activeId]);
+
+  const activeIdRef = useRef<string | null>(activeConversation?.id || null);
+  activeIdRef.current = activeConversation?.id || null;
 
   useEffect(() => {
     try {
@@ -246,11 +244,16 @@ export default function App() {
       }
 
       window.speechSynthesis.cancel();
-      const clean = stripMarkdownForSpeech(msg.content);
+      const clean = cleanTextForSpeech(msg.content);
       if (!clean) return;
 
       const utterance = new SpeechSynthesisUtterance(clean);
-      utterance.rate = 1.02;
+      const femaleVoice = selectBestFemaleVoice(window.speechSynthesis.getVoices());
+      if (femaleVoice) {
+        utterance.voice = femaleVoice;
+      }
+      utterance.rate = 0.99;
+      utterance.pitch = 1.06;
       utterance.onend = () => setSpeakingMessageId(null);
       utterance.onerror = () => setSpeakingMessageId(null);
 
@@ -522,6 +525,197 @@ export default function App() {
     [isStreaming, activeConversation?.id, conversations, streamReply]
   );
 
+  const handleVoiceTurn = useCallback(
+    async (
+      userText: string,
+      onStreamDelta: (partialResponse: string) => void,
+      signal: AbortSignal
+    ): Promise<{ text: string; error?: string | null }> => {
+      const clean = userText.trim();
+      if (!clean) return { text: '', error: 'Empty message.' };
+
+      const userMsg: ChatMessage = {
+        id: createId(),
+        role: 'user',
+        content: clean,
+      };
+      const assistantMsgId = createId();
+      const assistantPlaceholder: ChatMessage = {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: '',
+        error: null,
+      };
+
+      let targetChatId = activeIdRef.current;
+      let nextHistory: Array<{ role: string; content: string }> = [];
+
+      if (!targetChatId) {
+        targetChatId = createId();
+        const newChat: Conversation = {
+          id: targetChatId,
+          title: clean.length > 44 ? `${clean.slice(0, 44)}…` : clean,
+          updatedAt: Date.now(),
+          messages: [userMsg, assistantPlaceholder],
+        };
+        conversationsRef.current = [newChat, ...conversationsRef.current];
+        activeIdRef.current = targetChatId;
+        setConversations(conversationsRef.current);
+        setActiveId(targetChatId);
+        nextHistory = [{ role: 'user', content: clean }];
+      } else {
+        const existing = conversationsRef.current.find((c) => c.id === targetChatId);
+        const existingMessages = existing?.messages || [];
+        const updatedTitle =
+          existingMessages.length === 0
+            ? clean.length > 44
+              ? `${clean.slice(0, 44)}…`
+              : clean
+            : existing?.title || 'New conversation';
+
+        nextHistory = [...existingMessages, userMsg]
+          .filter((m) => !m.error && m.content)
+          .map((m) => ({ role: m.role, content: m.content }));
+
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === targetChatId
+              ? {
+                  ...c,
+                  title: updatedTitle,
+                  updatedAt: Date.now(),
+                  messages: [...c.messages, userMsg, assistantPlaceholder],
+                }
+              : c
+          )
+        );
+      }
+
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal,
+          body: JSON.stringify({
+            model,
+            messages: nextHistory,
+          }),
+        });
+
+        if (!res.ok) {
+          const errPayload = await res.json().catch(() => ({}));
+          throw new Error(errPayload.error || `Request failed (${res.status})`);
+        }
+        if (!res.body) {
+          throw new Error('Streaming response unavailable.');
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let accumulated = '';
+
+        const processEvents = (rawEvents: string[]) => {
+          for (const evt of rawEvents) {
+            const lines = evt.split('\n');
+            for (const line of lines) {
+              if (!line.startsWith('data:')) continue;
+              const jsonStr = line.slice(5).trim();
+              if (!jsonStr) continue;
+
+              const parsed = JSON.parse(jsonStr) as {
+                type: string;
+                text?: string;
+                message?: string;
+              };
+
+              if (parsed.type === 'delta' && parsed.text) {
+                accumulated += parsed.text;
+                const currentText = accumulated;
+                onStreamDelta(currentText);
+                setConversations((prev) =>
+                  prev.map((c) =>
+                    c.id === targetChatId
+                      ? {
+                          ...c,
+                          updatedAt: Date.now(),
+                          messages: c.messages.map((m) =>
+                            m.id === assistantMsgId ? { ...m, content: currentText } : m
+                          ),
+                        }
+                      : c
+                  )
+                );
+              } else if (parsed.type === 'error') {
+                throw new Error(parsed.message || 'Failed to generate a response.');
+              }
+            }
+          }
+        };
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            buffer += decoder.decode();
+            if (buffer.trim()) {
+              processEvents(buffer.replace(/\r\n/g, '\n').split('\n\n'));
+            }
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+          const events = buffer.split('\n\n');
+          buffer = events.pop() || '';
+          processEvents(events);
+        }
+
+        if (!accumulated.trim()) {
+          throw new Error('The model returned an empty response. Please try again.');
+        }
+
+        return { text: accumulated };
+      } catch (err) {
+        const errorObj = err as { name?: string; message?: string };
+        if (errorObj?.name === 'AbortError') {
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === targetChatId
+                ? {
+                    ...c,
+                    messages: c.messages.filter(
+                      (m) => m.id !== assistantMsgId || m.content.trim().length > 0
+                    ),
+                  }
+                : c
+            )
+          );
+          return { text: '' };
+        }
+
+        const errMsg =
+          typeof navigator !== 'undefined' && navigator.onLine === false
+            ? 'You appear to be offline. Reconnect and try again.'
+            : errorObj?.message || 'Unable to generate a response right now.';
+
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === targetChatId
+              ? {
+                  ...c,
+                  updatedAt: Date.now(),
+                  messages: c.messages.map((m) =>
+                    m.id === assistantMsgId ? { ...m, error: errMsg } : m
+                  ),
+                }
+              : c
+          )
+        );
+        return { text: '', error: errMsg };
+      }
+    },
+    [model]
+  );
+
   const handleRegenerate = useCallback(async () => {
     if (isStreaming || !activeConversation) return;
     const msgs = activeConversation.messages;
@@ -658,6 +852,19 @@ export default function App() {
           <div className="flex items-center gap-1 shrink-0">
             <button
               type="button"
+              onClick={() => {
+                stopSpeech();
+                setVoiceModeOpen(true);
+              }}
+              aria-label="Open Voice Mode"
+              title="Open Voice Mode"
+              className="h-9 px-3 rounded-lg flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-sky-400 bg-blue-50 dark:bg-sky-500/10 hover:bg-blue-100 dark:hover:bg-sky-500/20 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <AudioLines className="w-4 h-4" />
+              <span className="hidden sm:inline">Voice Mode</span>
+            </button>
+            <button
+              type="button"
               onClick={handleNewChat}
               aria-label="New chat"
               title="New chat"
@@ -744,12 +951,22 @@ export default function App() {
           onSubmit={() => sendPrompt(input)}
           onStop={stopStreaming}
           onToggleVoice={handleToggleVoice}
+          onOpenVoiceMode={() => {
+            stopSpeech();
+            setVoiceModeOpen(true);
+          }}
           isStreaming={isStreaming}
           isListening={isListening}
           voiceSupported={voiceSupported}
           notice={notice}
         />
       </main>
+
+      <VoiceMode
+        isOpen={voiceModeOpen}
+        onClose={() => setVoiceModeOpen(false)}
+        onSendTurn={handleVoiceTurn}
+      />
     </div>
   );
 }

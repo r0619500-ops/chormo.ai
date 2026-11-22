@@ -244,7 +244,6 @@ export default async function handler(req: AugmentedRequest, res: AugmentedRespo
   res.statusCode = 200;
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
@@ -336,12 +335,12 @@ export default async function handler(req: AugmentedRequest, res: AugmentedRespo
     const modelsToTry =
       model === 'gemini-4-hydrogen'
         ? [
-            { id: 'gemini-4-hydrogen', timeoutMs: 6000 },
-            { id: 'gemini-3.1-flash-lite', timeoutMs: 15000 },
+            { id: 'gemini-4-hydrogen', timeoutMs: 3500 },
+            { id: 'gemini-3.1-flash-lite', timeoutMs: 12000 },
           ]
         : [
             { id: 'gemini-3.1-flash-lite', timeoutMs: 12000 },
-            { id: 'gemini-3.1-flash-lite', timeoutMs: 15000 },
+            { id: 'gemini-3.1-flash-lite', timeoutMs: 12000 },
           ];
 
     for (let attempt = 0; attempt < modelsToTry.length; attempt++) {

@@ -5,8 +5,10 @@ import { VoiceOrbCanvas } from './VoiceOrbCanvas';
 import type { VoiceOrbState } from './VoiceOrbCanvas';
 import {
   cleanTextForSpeech,
+  getSupportedAudioMimeType,
   selectBestFemaleVoice,
   synthesizeGeminiSpeech,
+  transcribeAudioBlob,
 } from '../utils/voiceSpeech';
 
 interface VoiceModeProps {
@@ -51,6 +53,7 @@ interface SpeechRecognitionInstance {
 }
 
 type SpeechRecognitionConstructor = new () => SpeechRecognitionInstance;
+type CaptureEngine = 'speech-api' | 'gemini-audio';
 
 function getSpeechRecognitionCtor(): SpeechRecognitionConstructor | null {
   if (typeof window === 'undefined') return null;
@@ -69,30 +72,44 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   const [assistantTranscript, setAssistantTranscript] = useState('');
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [fallbackInput, setFallbackInput] = useState('');
+  const [captureEngine, setCaptureEngine] = useState<CaptureEngine>(() =>
+    getSpeechRecognitionCtor() ? 'speech-api' : 'gemini-audio'
+  );
 
   const audioLevelRef = useRef<number>(0);
   const isOpenRef = useRef(isOpen);
   const micMutedRef = useRef(micMuted);
   const speakerMutedRef = useRef(speakerMuted);
   const orbStateRef = useRef<VoiceOrbState>(orbState);
+  const captureEngineRef = useRef<CaptureEngine>(captureEngine);
 
   isOpenRef.current = isOpen;
   micMutedRef.current = micMuted;
   speakerMutedRef.current = speakerMuted;
   orbStateRef.current = orbState;
+  captureEngineRef.current = captureEngine;
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRafRef = useRef<number>(0);
   const silenceTimerRef = useRef<number | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
+  const transcribeAbortRef = useRef<AbortController | null>(null);
   const ttsAbortRef = useRef<AbortController | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const fallbackSpeechRafRef = useRef<number>(0);
   const speechTokenRef = useRef<number>(0);
   const finalBufferRef = useRef<string>('');
-  const speechSupported = Boolean(getSpeechRecognitionCtor());
+  const recordedChunksRef = useRef<BlobPart[]>([]);
+  const speechDetectedRef = useRef<boolean>(false);
+  const discardRecordingRef = useRef<boolean>(false);
+
+  const recorderSupported =
+    typeof window !== 'undefined' &&
+    typeof MediaRecorder !== 'undefined' &&
+    Boolean(navigator.mediaDevices?.getUserMedia);
 
   const ensureAudioContext = useCallback((): AudioContext | null => {
     if (typeof window === 'undefined') return null;
@@ -109,7 +126,21 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
     return audioCtxRef.current;
   }, []);
 
+  const stopMediaRecorderOnly = useCallback((discard: boolean) => {
+    discardRecordingRef.current = discard;
+    const rec = mediaRecorderRef.current;
+    if (rec && rec.state !== 'inactive') {
+      try {
+        rec.stop();
+      } catch {
+        // Ignore stop errors
+      }
+    }
+    mediaRecorderRef.current = null;
+  }, []);
+
   const stopMicAnalyser = useCallback(() => {
+    stopMediaRecorderOnly(true);
     if (analyserRafRef.current) {
       window.cancelAnimationFrame(analyserRafRef.current);
       analyserRafRef.current = 0;
@@ -119,7 +150,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       mediaStreamRef.current = null;
     }
     audioLevelRef.current = 0;
-  }, []);
+  }, [stopMediaRecorderOnly]);
 
   const stopRecognition = useCallback(() => {
     if (silenceTimerRef.current) {
@@ -166,68 +197,16 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   }, []);
 
   const stopAllActiveTurn = useCallback(() => {
+    if (transcribeAbortRef.current) {
+      transcribeAbortRef.current.abort();
+      transcribeAbortRef.current = null;
+    }
     if (chatAbortRef.current) {
       chatAbortRef.current.abort();
       chatAbortRef.current = null;
     }
     stopSpeakingAudio();
   }, [stopSpeakingAudio]);
-
-  const startMicMeter = useCallback(async () => {
-    if (!navigator.mediaDevices?.getUserMedia) return;
-    if (mediaStreamRef.current) return;
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      if (!isOpenRef.current || micMutedRef.current || orbStateRef.current !== 'listening') {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-
-      mediaStreamRef.current = stream;
-      const ctx = ensureAudioContext();
-      if (!ctx) return;
-
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.72;
-      source.connect(analyser);
-
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      const tick = () => {
-        if (!mediaStreamRef.current || orbStateRef.current !== 'listening') {
-          audioLevelRef.current = 0;
-          return;
-        }
-        analyser.getByteTimeDomainData(data);
-        let sumSq = 0;
-        for (let i = 0; i < data.length; i++) {
-          const normalized = (data[i] - 128) / 128;
-          sumSq += normalized * normalized;
-        }
-        const rms = Math.sqrt(sumSq / data.length);
-        audioLevelRef.current = Math.min(1, rms * 4.5);
-        analyserRafRef.current = window.requestAnimationFrame(tick);
-      };
-      analyserRafRef.current = window.requestAnimationFrame(tick);
-    } catch (err) {
-      const e = err as { name?: string };
-      if (e?.name === 'NotAllowedError' || e?.name === 'PermissionDeniedError') {
-        setErrorBanner(
-          'Microphone permission was denied. Allow microphone access in your browser and tap Retry.'
-        );
-        setMicMuted(true);
-        setOrbState('idle');
-      }
-    }
-  }, [ensureAudioContext]);
 
   const startListeningRef = useRef<() => void>(() => {});
 
@@ -418,7 +397,11 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       } catch (err) {
         const e = err as { name?: string; message?: string };
         if (e?.name === 'AbortError') return;
-        setErrorBanner(e?.message || 'Unable to reach CHROMO AI right now.');
+        setErrorBanner(
+          typeof navigator !== 'undefined' && navigator.onLine === false
+            ? 'You appear to be offline. Reconnect and try again.'
+            : e?.message || 'Unable to reach CHROMO AI right now.'
+        );
         if (!micMutedRef.current && isOpenRef.current) {
           startListeningRef.current();
         } else {
@@ -433,25 +416,280 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
     [onSendTurn, speakResponse, stopMicAnalyser, stopRecognition]
   );
 
+  const startGeminiAudioRecorder = useCallback(
+    (stream: MediaStream, analyser: AnalyserNode) => {
+      if (typeof MediaRecorder === 'undefined') {
+        setErrorBanner(
+          'Audio recording is not supported in this browser. Use the message box below to talk.'
+        );
+        return;
+      }
+
+      stopMediaRecorderOnly(true);
+      recordedChunksRef.current = [];
+      speechDetectedRef.current = false;
+      discardRecordingRef.current = false;
+
+      const mimeType = getSupportedAudioMimeType();
+      let recorder: MediaRecorder;
+      try {
+        recorder = mimeType
+          ? new MediaRecorder(stream, { mimeType })
+          : new MediaRecorder(stream);
+      } catch {
+        setErrorBanner('Unable to start microphone recorder in this browser.');
+        return;
+      }
+
+      const startedAt = performance.now();
+      let lastSpeechAt = startedAt;
+      let stoppedByVad = false;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          recordedChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        if (mediaRecorderRef.current === recorder) {
+          mediaRecorderRef.current = null;
+        }
+
+        const shouldDiscard = discardRecordingRef.current;
+        const hadSpeech = speechDetectedRef.current;
+        const chunks = recordedChunksRef.current;
+        recordedChunksRef.current = [];
+
+        if (shouldDiscard || !isOpenRef.current || micMutedRef.current) {
+          return;
+        }
+
+        const audioBlob = new Blob(chunks, {
+          type: recorder.mimeType || mimeType || 'audio/webm',
+        });
+
+        if (!hadSpeech || audioBlob.size < 1400) {
+          if (isOpenRef.current && !micMutedRef.current && orbStateRef.current === 'listening') {
+            startListeningRef.current();
+          }
+          return;
+        }
+
+        stopMicAnalyser();
+        setOrbState('thinking');
+        setUserTranscript('Transcribing...');
+        setErrorBanner(null);
+
+        const controller = new AbortController();
+        transcribeAbortRef.current = controller;
+
+        const { transcript, error } = await transcribeAudioBlob(audioBlob, controller.signal);
+        if (transcribeAbortRef.current === controller) {
+          transcribeAbortRef.current = null;
+        }
+
+        if (!isOpenRef.current || controller.signal.aborted) return;
+
+        if (error) {
+          setErrorBanner(error);
+          if (!micMutedRef.current) {
+            startListeningRef.current();
+          } else {
+            setOrbState('idle');
+          }
+          return;
+        }
+
+        if (!transcript) {
+          setUserTranscript('');
+          if (!micMutedRef.current) {
+            startListeningRef.current();
+          } else {
+            setOrbState('idle');
+          }
+          return;
+        }
+
+        await submitSpokenTurn(transcript);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start(250);
+
+      // Monitor RMS energy for Voice Activity Detection (auto-send on natural pause)
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const monitorVad = () => {
+        if (
+          !isOpenRef.current ||
+          micMutedRef.current ||
+          orbStateRef.current !== 'listening' ||
+          captureEngineRef.current !== 'gemini-audio' ||
+          mediaRecorderRef.current !== recorder
+        ) {
+          return;
+        }
+
+        analyser.getByteTimeDomainData(data);
+        let sumSq = 0;
+        for (let i = 0; i < data.length; i++) {
+          const normalized = (data[i] - 128) / 128;
+          sumSq += normalized * normalized;
+        }
+        const rms = Math.sqrt(sumSq / data.length);
+        audioLevelRef.current = Math.min(1, rms * 4.5);
+
+        const now = performance.now();
+        if (rms > 0.028) {
+          speechDetectedRef.current = true;
+          lastSpeechAt = now;
+        }
+
+        const silenceMs = now - lastSpeechAt;
+        const totalMs = now - startedAt;
+
+        if (
+          !stoppedByVad &&
+          ((speechDetectedRef.current && silenceMs >= 1150) || totalMs >= 20000)
+        ) {
+          stoppedByVad = true;
+          if (!speechDetectedRef.current) {
+            // Restart fresh window if 20s of silence elapsed
+            stopMediaRecorderOnly(true);
+            startGeminiAudioRecorder(stream, analyser);
+            return;
+          }
+          stopMediaRecorderOnly(false);
+          return;
+        }
+
+        analyserRafRef.current = window.requestAnimationFrame(monitorVad);
+      };
+
+      analyserRafRef.current = window.requestAnimationFrame(monitorVad);
+    },
+    [stopMediaRecorderOnly, stopMicAnalyser, submitSpokenTurn]
+  );
+
+  const startMicPipeline = useCallback(
+    async (enableVadRecorder: boolean) => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        if (enableVadRecorder) {
+          setErrorBanner(
+            'Microphone capture is unavailable in this browser. Type below to talk with CHROMO AI.'
+          );
+        }
+        return;
+      }
+
+      if (mediaStreamRef.current) {
+        if (enableVadRecorder) {
+          const ctx = ensureAudioContext();
+          if (ctx) {
+            const source = ctx.createMediaStreamSource(mediaStreamRef.current);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 256;
+            analyser.smoothingTimeConstant = 0.72;
+            source.connect(analyser);
+            startGeminiAudioRecorder(mediaStreamRef.current, analyser);
+          }
+        }
+        return;
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+
+        if (!isOpenRef.current || micMutedRef.current || orbStateRef.current !== 'listening') {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        mediaStreamRef.current = stream;
+        const ctx = ensureAudioContext();
+        if (!ctx) return;
+
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.72;
+        source.connect(analyser);
+
+        if (enableVadRecorder) {
+          startGeminiAudioRecorder(stream, analyser);
+          return;
+        }
+
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        const tick = () => {
+          if (
+            !mediaStreamRef.current ||
+            orbStateRef.current !== 'listening' ||
+            captureEngineRef.current !== 'speech-api'
+          ) {
+            return;
+          }
+          analyser.getByteTimeDomainData(data);
+          let sumSq = 0;
+          for (let i = 0; i < data.length; i++) {
+            const normalized = (data[i] - 128) / 128;
+            sumSq += normalized * normalized;
+          }
+          const rms = Math.sqrt(sumSq / data.length);
+          audioLevelRef.current = Math.min(1, rms * 4.5);
+          analyserRafRef.current = window.requestAnimationFrame(tick);
+        };
+        analyserRafRef.current = window.requestAnimationFrame(tick);
+      } catch (err) {
+        const e = err as { name?: string };
+        if (e?.name === 'NotAllowedError' || e?.name === 'PermissionDeniedError') {
+          setErrorBanner(
+            'Microphone permission was denied. Allow microphone access in your browser and tap Retry.'
+          );
+          setMicMuted(true);
+          micMutedRef.current = true;
+          setOrbState('idle');
+        } else if (e?.name === 'NotFoundError' || e?.name === 'DevicesNotFoundError') {
+          setErrorBanner('No microphone was found on this device.');
+          setMicMuted(true);
+          micMutedRef.current = true;
+          setOrbState('idle');
+        }
+      }
+    },
+    [ensureAudioContext, startGeminiAudioRecorder]
+  );
+
   const startListening = useCallback(() => {
     if (!isOpenRef.current || micMutedRef.current) {
       setOrbState('idle');
       return;
     }
 
-    const SpeechRec = getSpeechRecognitionCtor();
     setErrorBanner(null);
     setOrbState('listening');
     finalBufferRef.current = '';
 
-    // Always try live mic audio meter for true audio-reactive orb
-    void startMicMeter();
+    const SpeechRec = getSpeechRecognitionCtor();
+    const shouldUseSpeechApi = captureEngineRef.current === 'speech-api' && Boolean(SpeechRec);
 
-    if (!SpeechRec) {
+    if (!shouldUseSpeechApi) {
+      captureEngineRef.current = 'gemini-audio';
+      setCaptureEngine('gemini-audio');
+      void startMicPipeline(true);
       return;
     }
 
+    void startMicPipeline(false);
     stopRecognition();
+
+    if (!SpeechRec) return;
 
     const recognition = new SpeechRec();
     recognition.lang = 'en-US';
@@ -500,16 +738,28 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
 
     recognition.onerror = (event) => {
       if (!isOpenRef.current) return;
+
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
         setErrorBanner(
           'Microphone access was denied. Enable microphone permissions in your browser and tap Retry.'
         );
         setMicMuted(true);
+        micMutedRef.current = true;
         setOrbState('idle');
         stopMicAnalyser();
-      } else if (event.error === 'audio-capture') {
-        // Release getUserMedia meter if browser restricts concurrent capture
-        stopMicAnalyser();
+      } else if (
+        event.error === 'network' ||
+        event.error === 'language-not-supported' ||
+        event.error === 'audio-capture'
+      ) {
+        // Browser speech service failed (common in privacy browsers, proxies, or mobile WebViews).
+        // Seamlessly switch to Gemini Audio transcription (/api/transcribe) with MediaRecorder!
+        captureEngineRef.current = 'gemini-audio';
+        setCaptureEngine('gemini-audio');
+        stopRecognition();
+        if (isOpenRef.current && !micMutedRef.current && orbStateRef.current === 'listening') {
+          void startMicPipeline(true);
+        }
       } else if (event.error !== 'no-speech' && event.error !== 'aborted') {
         setErrorBanner(`Voice recognition error: ${event.error}`);
       }
@@ -519,6 +769,10 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       if (recognitionRef.current !== recognition) return;
       recognitionRef.current = null;
 
+      if (captureEngineRef.current !== 'speech-api') {
+        return;
+      }
+
       const pending = finalBufferRef.current.trim();
       finalBufferRef.current = '';
       if (pending && isOpenRef.current && orbStateRef.current === 'listening') {
@@ -527,9 +781,13 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       }
 
       if (isOpenRef.current && !micMutedRef.current && orbStateRef.current === 'listening') {
-        // Keep listening continuously while active
         window.setTimeout(() => {
-          if (isOpenRef.current && !micMutedRef.current && orbStateRef.current === 'listening') {
+          if (
+            isOpenRef.current &&
+            !micMutedRef.current &&
+            orbStateRef.current === 'listening' &&
+            captureEngineRef.current === 'speech-api'
+          ) {
             startListeningRef.current();
           }
         }, 250);
@@ -542,11 +800,10 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
     } catch {
       // Ignore duplicate start race
     }
-  }, [startMicMeter, stopMicAnalyser, stopRecognition, submitSpokenTurn]);
+  }, [startMicPipeline, stopMicAnalyser, stopRecognition, submitSpokenTurn]);
 
   startListeningRef.current = startListening;
 
-  // Initialize / teardown when VoiceMode opens or closes
   useEffect(() => {
     if (!isOpen) {
       stopAllActiveTurn();
@@ -556,11 +813,13 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       return;
     }
 
-    // Preload browser speech voices
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.getVoices();
     }
 
+    const initialEngine: CaptureEngine = getSpeechRecognitionCtor() ? 'speech-api' : 'gemini-audio';
+    captureEngineRef.current = initialEngine;
+    setCaptureEngine(initialEngine);
     setUserTranscript('');
     setAssistantTranscript('');
     setErrorBanner(null);
@@ -591,7 +850,6 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   }, [startListening, stopAllActiveTurn]);
 
   const handleToggleMic = useCallback(() => {
-    // If AI is speaking or thinking, tapping mic interrupts immediately and starts listening
     if (orbStateRef.current === 'speaking' || orbStateRef.current === 'thinking') {
       handleInterruptAndListen();
       return;
@@ -628,12 +886,23 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
   const handleOrbClick = useCallback(() => {
     if (orbStateRef.current === 'speaking' || orbStateRef.current === 'thinking') {
       handleInterruptAndListen();
-    } else {
-      handleToggleMic();
+      return;
     }
-  }, [handleInterruptAndListen, handleToggleMic]);
 
-  // Keyboard shortcuts inside Voice Mode (Escape to exit, Space to interrupt speaking)
+    // If user is recording via Gemini Audio VAD and taps the orb after speaking, send immediately!
+    if (
+      orbStateRef.current === 'listening' &&
+      captureEngineRef.current === 'gemini-audio' &&
+      mediaRecorderRef.current &&
+      speechDetectedRef.current
+    ) {
+      stopMediaRecorderOnly(false);
+      return;
+    }
+
+    handleToggleMic();
+  }, [handleInterruptAndListen, handleToggleMic, stopMediaRecorderOnly]);
+
   useEffect(() => {
     if (!isOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -680,11 +949,11 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
     orbState === 'speaking'
       ? 'Tap the orb or Stop to interrupt'
       : orbState === 'thinking'
-        ? 'CHROMO AI is forming a reply'
+        ? 'CHROMO AI is responding'
         : orbState === 'listening'
-          ? speechSupported
-            ? 'Speak naturally — I will reply automatically'
-            : 'Type below to speak with CHROMO AI'
+          ? captureEngine === 'gemini-audio'
+            ? 'Speak naturally — pause or tap the orb to send'
+            : 'Speak naturally — I will reply automatically'
           : 'Tap the microphone to resume listening';
 
   return (
@@ -694,7 +963,6 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
       aria-label="CHROMO AI Voice Mode"
       className="fixed inset-0 z-50 flex flex-col bg-[#05070e] text-zinc-100 overflow-hidden"
     >
-      {/* Subtle ambient background glow */}
       <div
         aria-hidden="true"
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_40%,rgba(56,189,248,0.11),rgba(99,102,241,0.08)_38%,transparent_72%)]"
@@ -780,8 +1048,8 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
           )}
         </div>
 
-        {/* Fallback text input for browsers without SpeechRecognition */}
-        {!speechSupported && (
+        {/* Fallback text input when microphone/recorder is unavailable */}
+        {(!recorderSupported || errorBanner) && (
           <form
             onSubmit={handleFallbackSubmit}
             className="mt-3 w-full max-w-xl flex items-center gap-2 px-3 py-1.5 rounded-xl border border-white/10 bg-white/[0.04]"
@@ -790,7 +1058,7 @@ export function VoiceMode({ isOpen, onClose, onSendTurn }: VoiceModeProps) {
               type="text"
               value={fallbackInput}
               onChange={(e) => setFallbackInput(e.target.value)}
-              placeholder="Voice input unavailable in this browser — type to talk..."
+              placeholder="Type here to talk with CHROMO AI..."
               className="flex-1 bg-transparent text-sm text-white placeholder:text-zinc-500 outline-none py-1.5"
             />
             <button

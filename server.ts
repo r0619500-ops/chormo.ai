@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import chatHandler from './api/chat.ts';
 import healthHandler from './api/health.ts';
+import transcribeHandler from './api/transcribe.ts';
 import ttsHandler from './api/tts.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -15,7 +16,7 @@ const PORT = Number(process.env.PORT) || 3000;
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '8mb' }));
 
   app.all('/api/health', (req: Request, res: Response) => {
     healthHandler(req, res);
@@ -27,6 +28,10 @@ async function startServer() {
 
   app.all('/api/tts', async (req: Request, res: Response) => {
     await ttsHandler(req, res);
+  });
+
+  app.all('/api/transcribe', async (req: Request, res: Response) => {
+    await transcribeHandler(req, res);
   });
 
   const isProd = process.env.NODE_ENV === 'production';

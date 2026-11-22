@@ -5,7 +5,12 @@ import { ChromoLogo } from './components/ChromoLogo';
 import { Composer } from './components/Composer';
 import { Sidebar } from './components/Sidebar';
 import { VoiceMode } from './components/VoiceMode';
-import { cleanTextForSpeech, selectBestFemaleVoice } from './utils/voiceSpeech';
+import {
+  cleanTextForSpeech,
+  getSupportedAudioMimeType,
+  selectBestFemaleVoice,
+  transcribeAudioBlob,
+} from './utils/voiceSpeech';
 import { MODEL_OPTIONS } from './types/chat';
 import type { ChatMessage, Conversation, ModelOption } from './types/chat';
 
@@ -134,13 +139,21 @@ export default function App() {
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const dictationRecorderRef = useRef<MediaRecorder | null>(null);
+  const dictationStreamRef = useRef<MediaStream | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const conversationsRef = useRef<Conversation[]>(conversations);
   conversationsRef.current = conversations;
 
   const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window;
-  const voiceSupported = useMemo(() => Boolean(getSpeechRecognitionCtor()), []);
+  const voiceSupported = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    return (
+      Boolean(getSpeechRecognitionCtor()) ||
+      (typeof MediaRecorder !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia))
+    );
+  }, []);
 
   const showNotice = useCallback((msg: string, duration = 3500) => {
     setNotice(msg);
@@ -199,6 +212,14 @@ export default function App() {
     return () => {
       abortControllerRef.current?.abort();
       recognitionRef.current?.stop();
+      if (dictationRecorderRef.current && dictationRecorderRef.current.state !== 'inactive') {
+        try {
+          dictationRecorderRef.current.stop();
+        } catch {
+          // Ignore
+        }
+      }
+      dictationStreamRef.current?.getTracks().forEach((t) => t.stop());
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
       }
@@ -263,10 +284,67 @@ export default function App() {
     [ttsSupported, speakingMessageId, stopSpeech, showNotice]
   );
 
+  const startAudioDictationFallback = useCallback(
+    async (baseText: string) => {
+      if (typeof MediaRecorder === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+        showNotice('Voice dictation is not supported in this browser.');
+        return;
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        dictationStreamRef.current = stream;
+        const mimeType = getSupportedAudioMimeType();
+        const recorder = mimeType
+          ? new MediaRecorder(stream, { mimeType })
+          : new MediaRecorder(stream);
+        const chunks: BlobPart[] = [];
+
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) chunks.push(e.data);
+        };
+
+        recorder.onstop = async () => {
+          setIsListening(false);
+          dictationRecorderRef.current = null;
+          dictationStreamRef.current?.getTracks().forEach((t) => t.stop());
+          dictationStreamRef.current = null;
+
+          const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || 'audio/webm' });
+          if (blob.size < 800) return;
+
+          showNotice('Transcribing speech…', 6000);
+          const { transcript, error } = await transcribeAudioBlob(blob);
+          if (error) {
+            showNotice(error);
+          } else if (transcript) {
+            setInput(baseText ? `${baseText} ${transcript}` : transcript);
+            showNotice('Transcribed.', 1500);
+          } else {
+            showNotice('No speech detected.', 2000);
+          }
+        };
+
+        dictationRecorderRef.current = recorder;
+        recorder.start(250);
+        setIsListening(true);
+        showNotice('Listening… tap mic again when finished', 10000);
+      } catch (err) {
+        setIsListening(false);
+        const e = err as { name?: string };
+        if (e?.name === 'NotAllowedError' || e?.name === 'PermissionDeniedError') {
+          showNotice('Microphone access was denied. Enable permissions in your browser settings.');
+        } else {
+          showNotice('Could not start microphone recording.');
+        }
+      }
+    },
+    [showNotice]
+  );
+
   const handleToggleVoice = useCallback(() => {
-    const SpeechRec = getSpeechRecognitionCtor();
-    if (!SpeechRec) {
-      showNotice('Voice input is not supported in this browser. Try Chrome or Edge.');
+    if (isListening && dictationRecorderRef.current) {
+      dictationRecorderRef.current.stop();
       return;
     }
 
@@ -275,12 +353,17 @@ export default function App() {
       return;
     }
 
+    const baseText = input.trim();
+    const SpeechRec = getSpeechRecognitionCtor();
+    if (!SpeechRec) {
+      void startAudioDictationFallback(baseText);
+      return;
+    }
+
     const recognition = new SpeechRec();
     recognition.lang = 'en-US';
     recognition.interimResults = true;
     recognition.continuous = false;
-
-    const baseText = input.trim();
 
     recognition.onstart = () => {
       setIsListening(true);
@@ -299,7 +382,11 @@ export default function App() {
     recognition.onerror = (event) => {
       if (event.error === 'not-allowed') {
         showNotice('Microphone access was denied. Enable permissions in your browser settings.');
-      } else if (event.error !== 'aborted') {
+      } else if (event.error === 'network' || event.error === 'service-not-allowed') {
+        recognitionRef.current = null;
+        setIsListening(false);
+        void startAudioDictationFallback(baseText);
+      } else if (event.error !== 'aborted' && event.error !== 'no-speech') {
         showNotice(`Voice input error: ${event.error}`);
       }
     };
@@ -312,9 +399,9 @@ export default function App() {
     try {
       recognition.start();
     } catch {
-      showNotice('Could not start microphone input.');
+      void startAudioDictationFallback(baseText);
     }
-  }, [isListening, input, showNotice]);
+  }, [isListening, input, showNotice, startAudioDictationFallback]);
 
   const streamReply = useCallback(
     async (chatId: string, historyForServer: Array<{ role: string; content: string }>) => {

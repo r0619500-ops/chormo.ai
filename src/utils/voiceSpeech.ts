@@ -1,6 +1,6 @@
 export function cleanTextForSpeech(raw: string): string {
   return raw
-    .replace(/```[\s\S]*?```/g, ' Here is a code example shown on screen. ')
+    .replace(/```[\s\S]*?```/g, ' Here is the code example shown on screen. ')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
     .replace(/[#>*_~]/g, ' ')
@@ -97,5 +97,77 @@ export async function synthesizeGeminiSpeech(
     return bytes.buffer;
   } catch {
     return null;
+  }
+}
+
+export function getSupportedAudioMimeType(): string {
+  if (typeof MediaRecorder === 'undefined') return '';
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
+    'audio/ogg',
+  ];
+  for (const mime of candidates) {
+    if (MediaRecorder.isTypeSupported(mime)) {
+      return mime;
+    }
+  }
+  return '';
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...slice);
+  }
+  return btoa(binary);
+}
+
+export async function transcribeAudioBlob(
+  blob: Blob,
+  signal?: AbortSignal
+): Promise<{ transcript: string; error?: string }> {
+  try {
+    const buffer = await blob.arrayBuffer();
+    const audioBase64 = arrayBufferToBase64(buffer);
+    const mimeType = (blob.type || 'audio/webm').split(';')[0].trim();
+
+    const res = await fetch('/api/transcribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({ audioBase64, mimeType }),
+    });
+
+    const payload = (await res.json().catch(() => ({}))) as {
+      transcript?: string;
+      error?: string;
+    };
+
+    if (!res.ok) {
+      return {
+        transcript: '',
+        error: payload.error || `Transcription failed (${res.status}).`,
+      };
+    }
+
+    return { transcript: (payload.transcript || '').trim() };
+  } catch (err) {
+    const e = err as { name?: string; message?: string };
+    if (e?.name === 'AbortError') {
+      return { transcript: '' };
+    }
+    return {
+      transcript: '',
+      error:
+        typeof navigator !== 'undefined' && navigator.onLine === false
+          ? 'You appear to be offline. Check your connection and try again.'
+          : 'Unable to reach the voice transcription service.',
+    };
   }
 }
